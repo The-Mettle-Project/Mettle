@@ -3462,6 +3462,16 @@ static int program_tile_kernel(const IRProgram *program, const char *name) {
   return 0;
 }
 
+static int program_holds_tile_kernels(const IRProgram *program) {
+  for (size_t i = 0; program && i < program->function_count; i++) {
+    if (program->functions[i] && program->functions[i]->is_kernel &&
+        function_holds_tiles(program->functions[i])) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static int confirm_tile_residency(const IRProgram *program,
                                   const char *ptx_path, const char *arch,
                                   const char *source) {
@@ -3469,15 +3479,8 @@ static int confirm_tile_residency(const IRProgram *program,
   char command[1200];
   char line[512];
   char entry[256] = {0};
-  int any = 0;
   int ok = 1;
-  for (size_t i = 0; program && i < program->function_count; i++) {
-    if (program->functions[i] && program->functions[i]->is_kernel &&
-        function_holds_tiles(program->functions[i])) {
-      any = 1;
-    }
-  }
-  if (!any) {
+  if (!program_holds_tile_kernels(program)) {
     return 1;
   }
   if (!gpu_detect_ptxas_version()) {
@@ -6802,7 +6805,7 @@ static int compile_optimize_device_ir(IRProgram *ir_program, ASTNode *program,
                                       CompilerProfile *profile) {
   double phase_start;
   int opt_ok;
-  if (!options->optimize) {
+  if (!options->optimize && !program_holds_tile_kernels(ir_program)) {
     return compile_check_numerics(ir_program, options);
   }
   compiler_set_phase(PROFILE_PHASE_IR_OPTIMIZATION);

@@ -825,7 +825,9 @@ static const ErrorCodeDoc DOCS[] = {
      "not stay in registers is not what the program asked for.\n"
      "\n"
      "Without ptxas on PATH the build says the tiles are unconfirmed and\n"
-     "goes on, so the gap is stated.\n"
+     "goes on, so the gap is stated. Kernels are optimized whenever one\n"
+     "holds a tile, with or without -O, so this is not a debug build's\n"
+     "extra values.\n"
      "\n"
      "Fix: shrink a tile or what is live beside it.\n"},
     {"F0004", "A function declared @pure performs something",

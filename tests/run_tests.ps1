@@ -2983,6 +2983,10 @@ $cases = @(
      SkipBinaryCheck = $true
      OutputMustMatch = @("2 passed")
      OutputMustNotMatch = @("failed") },
+  @{ Name = "gpu_tile_kernel_debug_build"; Path = "tests/gpu/tile_kernel_debug_build.mettle"; ShouldSucceed = $true
+     Args = @("--emit-ptx")
+     SkipBinaryCheck = $true
+     OutputMustNotMatch = @("G0002") },
   @{ Name = "err_gpu_tile_layout_mismatch"; Path = "tests/err_gpu_tile_layout_mismatch.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "A operand for this descriptor is 'float16.16,16. layout fragment_a'; this is 'float32.16,16. layout fragment_c'" },
   @{ Name = "err_gpu_tile_cast_layout"; Path = "tests/err_gpu_tile_cast_layout.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "is laid out fragment_c and 'float16.16,16. layout fragment_b' is laid out fragment_b" },
   @{ Name = "err_gpu_tile_spill"; Path = "tests/err_gpu_tile_spill.mettle"; ShouldSucceed = $false; Args = @("--emit-ptx"); Pattern = "error.G0001.: kernel 'too_many_registers' holds 256 tile registers at line 3, over its budget of 255" },

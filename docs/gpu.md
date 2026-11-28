@@ -1499,7 +1499,9 @@ A run of element-wise operations, ending at most in one row reduction, is
 emitted one element at a time, so a tile made and used only inside the run
 costs nothing. When `ptxas` is on `PATH` the build also assembles the module
 and refuses a kernel with tiles that the assembler spilled (`G0002`); without
-it the build says the tiles are unconfirmed. `--explain` and
+it the build says the tiles are unconfirmed. Kernels are optimized whenever a
+kernel holds a tile, with or without `-O`, because unoptimized code keeps
+values beside the tiles that push it past the registers. `--explain` and
 `--report-gpu-types` list every tile:
 
 ```text

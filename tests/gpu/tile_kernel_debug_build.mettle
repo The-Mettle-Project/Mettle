@@ -1,0 +1,74 @@
+// mmll's flash attention forward kernel for 64-wide heads. Built without -O,
+// its unoptimized code kept the call to z32 and spilled four bytes beside the
+// register tiles, and the build stopped with G0002. A kernel that holds tiles
+// is now optimized in any build, so this file must build without -O too.
+
+fn z32() -> float32 { return (float32)0.0; }
+
+kernel(block = 128) tflash_fwd_64(qkv: float32*, out: float32*, lse: float32*, time: int32, width: int32, heads: int32, causal: int32, scale: float32) {
+  const HD: int32 = 64;
+  const LD: int32 = 72;
+  const PER: int32 = 16;
+  const KV: int32 = 2304;
+  workgroup var ks: uint16[KV];
+  workgroup var vs: uint16[KV];
+  var t: int32 = thread.x;
+  var warp: int32 = thread.x >> 5;
+  var bh: int32 = block.y;
+  var b: int32 = bh / heads;
+  var hh: int32 = bh - b * heads;
+  var q0: int32 = block.x * 64;
+  var wq: int32 = q0 + warp * 16;
+  var stride: int64 = (int64)(3 * width);
+  var head: float32* = qkv + (int64)b * (int64)time * stride + (int64)(hh * HD);
+  var rows: int32 = time - wq;
+  if (rows > 16) { rows = 16; }
+  if (rows < 0) { rows = 0; }
+  var cap: int32 = if causal != 0 { 0 } else { 1 << 30 };
+  var qt: bfloat16[16, HD] layout fragment_a;
+  tile_load(qt, head + (int64)wq * stride, ld: stride, rows: rows);
+  var o: float32[16, HD] layout fragment_c = 0.0;
+  var m: float32[16] layout fragment_c = -1.0e30;
+  var l: float32[16] layout fragment_c = 0.0;
+  var kend: int32 = time;
+  if (causal != 0 && q0 + 64 < kend) { kend = q0 + 64; }
+  var chunks: int32 = (kend + 31) / 32;
+  for c in 0..chunks {
+    var j0: int32 = c * 32;
+    comptime for i in 0..PER {
+      var idx: int32 = t + 128 * i;
+      var kr: int32 = idx / HD;
+      var d: int32 = idx - kr * HD;
+      var kv: float32 = z32();
+      var vv: float32 = z32();
+      if (j0 + kr < time) {
+        var src: float32* = head + (int64)(j0 + kr) * stride + (int64)d;
+        kv = src[width];
+        vv = src[2 * width];
+      }
+      ks[kr * LD + d] = (uint16)f2bf(kv);
+      vs[kr * LD + d] = (uint16)f2bf(vv);
+    }
+    barrier(workgroup, acq_rel);
+    var s: float32[16, 32] layout fragment_c;
+    tensor_mma(qt, &ks[0], 0.0, s, m: 16, n: 32, k: HD, a_type: bf16, b_type: bf16,
+               accumulator_type: f32, result_type: f32, b_layout: col, ldb: LD);
+    s = s * scale;
+    var seen: bool[16, 32] layout fragment_c = tile_col(s) + j0 < time && tile_col(s) + j0 <= tile_row(s) + wq + cap;
+    var mx: float32[16] layout fragment_c = row_max(select(seen, s, -1.0e30));
+    var mn: float32[16] layout fragment_c = max(m, mx);
+    var alpha: float32[16] layout fragment_c = expf(m - mn);
+    var p: float32[16, 32] layout fragment_c = select(seen, expf(s - mn), 0.0);
+    l = l * alpha + row_sum(p);
+    m = mn;
+    var pa: bfloat16[16, 32] layout fragment_a = (bfloat16[16, 32] layout fragment_a)p;
+    tensor_mma(pa, &vs[0], o, o, m: 16, n: HD, k: 32, a_type: bf16, b_type: bf16,
+               accumulator_type: f32, result_type: f32, b_layout: row, ldb: LD,
+               c_scale_mode: per_row, c_scale: alpha);
+    barrier(workgroup, acq_rel);
+  }
+  o = o / l;
+  tile_store(out + ((int64)b * (int64)time + (int64)wq) * (int64)width + (int64)(hh * HD), o, ld: width, rows: rows);
+  var ls: float32[16] layout fragment_c = m + logf(l);
+  tile_store(lse + (int64)bh * (int64)time + (int64)wq, ls, ld: 1, rows: rows);
+}
